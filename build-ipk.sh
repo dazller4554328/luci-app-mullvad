@@ -5,7 +5,7 @@
 set -eu
 
 PKG=luci-app-mullvad
-VERSION=1.0.0
+VERSION=1.0.1
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT="$HERE/dist"
 WORK=$(mktemp -d)

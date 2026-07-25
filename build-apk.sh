@@ -6,7 +6,7 @@
 set -eu
 
 PKG=luci-app-mullvad
-VERSION=1.0.0-r1
+VERSION=1.0.1-r1
 APK=${APK:-apk}
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT="$HERE/dist"
@@ -75,8 +75,10 @@ $FAKEROOT sh -c "chown -R 0:0 '$WORK/data' && '$APK' mkpkg \
 	--info 'name:$PKG' \
 	--info 'version:$VERSION' \
 	--info 'description:LuCI app for Mullvad VPN: relay browser with latency probing, one-field account setup, connection checks and automatic relay failover' \
-	--info 'arch:all' \
+	--info 'arch:noarch' \
 	--info 'license:MIT' \
+	--info 'maintainer:dazller4554328' \
+	--info 'tags:openwrt:section=luci' \
 	--info 'url:https://github.com/dazller4554328/luci-app-mullvad' \
 	--info 'depends:luci-base luci-proto-wireguard wireguard-tools' \
 	--script 'post-install:$WORK/post-install' \
