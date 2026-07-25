@@ -54,16 +54,26 @@ apk add luci-proto-wireguard wireguard-tools
 
 ## Installation
 
-### A. Upload through LuCI (opkg-based builds, ≤ 24.10 and most community builds)
+Pick the package matching your build's package manager (`which apk` on the
+router tells you): newer OpenWrt (post-24.10, e.g. 25.x) uses **apk**, older
+builds use **opkg**.
 
-1. Download `dist/luci-app-mullvad_1.0.0_all.ipk`.
-2. LuCI → **System → Software → Upload Package…** → select the ipk → Install.
+### A. Upload through LuCI
+
+1. Download the right file from the release page:
+   - apk-based builds (25.x): `luci-app-mullvad-1.0.0-r1.apk`
+   - opkg-based builds (≤ 24.10): `luci-app-mullvad_1.0.0_all.ipk`
+2. LuCI → **System → Software → Upload Package…** → select it → Install.
 3. Log out of LuCI and back in (or hard-refresh). **Services → Mullvad VPN**.
 
-### B. Script install (apk-based builds and development)
+The apk package is unsigned; if apk rejects it with an "UNTRUSTED signature"
+error, install it from SSH instead:
 
-Newer OpenWrt (post-24.10, e.g. 25.x) replaced opkg with `apk`, which does not
-accept ipk files. Use the installer script instead:
+```sh
+apk add --allow-untrusted /tmp/upload.apk    # or wherever you copied it
+```
+
+### B. Script install (any build, and development)
 
 ```sh
 scp -r luci-app-mullvad root@192.168.1.1:/tmp/
