@@ -1,0 +1,8 @@
+config mullvad 'config'
+	option interface 'mullvad'
+	option endpoint_port '51820'
+	option cache_ttl '86400'
+	option gateway '10.64.0.1'
+	option failover '0'
+	option failover_interval '30'
+	option failover_scope 'city'

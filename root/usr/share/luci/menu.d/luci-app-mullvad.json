@@ -1,0 +1,30 @@
+{
+	"admin/services/mullvad": {
+		"title": "Mullvad VPN",
+		"order": 40,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [ "luci-app-mullvad" ]
+		}
+	},
+
+	"admin/services/mullvad/overview": {
+		"title": "Overview",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "mullvad/overview"
+		}
+	},
+
+	"admin/services/mullvad/settings": {
+		"title": "Settings",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "mullvad/settings"
+		}
+	}
+}

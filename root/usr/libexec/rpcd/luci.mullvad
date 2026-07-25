@@ -1,0 +1,423 @@
+#!/usr/bin/ucode
+'use strict';
+
+// rpcd exec plugin backing luci-app-mullvad.
+//
+// Registered on ubus as "luci.mullvad". The relay list from Mullvad's API is
+// ~500 KB; it is downloaded and compacted here, server-side, so the browser
+// only ever receives a ~100 KB payload. This stays well below the 1 MB ubus
+// message limit that breaks naive fs.read() approaches.
+//
+// Methods:
+//   relays {refresh, max_age}  - compact relay list (cached, /tmp + /etc seed)
+//   status {device}            - parsed `wg show <dev> dump`
+//   check  {}                  - am.i.mullvad.net exit check
+//   probe  {targets: [ip...]}  - concurrent ping RTT measurement
+//   setup  {account}           - generate keypair + register device with Mullvad
+
+import { readfile, writefile, popen, stat, mkdir, unlink, stdin } from 'fs';
+
+const API_URL = 'https://api.mullvad.net/app/v1/relays';
+const CHECK_URL = 'https://am.i.mullvad.net/json';
+const AUTH_URL = 'https://api.mullvad.net/auth/v1/token';
+const DEVICES_URL = 'https://api.mullvad.net/accounts/v1/devices';
+const LEGACY_WG_URL = 'https://api.mullvad.net/wg/';
+
+const CACHE_DIR = '/tmp/mullvad';
+const CACHE_FILE = CACHE_DIR + '/relays.json';
+const PERSIST_DIR = '/etc/mullvad';
+const PERSIST_FILE = PERSIST_DIR + '/relays.json';
+const DEFAULT_TTL = 86400;
+const DL_TIMEOUT = 20;
+const MAX_PROBE_TARGETS = 12;
+
+function ensure_dir(dir) {
+	if (!stat(dir))
+		mkdir(dir, 0o755);
+}
+
+function cmp(a, b) {
+	return a < b ? -1 : (a > b ? 1 : 0);
+}
+
+function have(bin) {
+	const proc = popen(sprintf("command -v '%s' 2>/dev/null", bin), 'r');
+	if (!proc)
+		return false;
+	const out = proc.read('all');
+	proc.close();
+	return length(trim(out ?? '')) > 0;
+}
+
+function run(cmdline) {
+	const proc = popen(cmdline, 'r');
+	if (!proc)
+		return { rc: -1, out: '' };
+	const out = proc.read('all');
+	const rc = proc.close();
+	return { rc: rc, out: out ?? '' };
+}
+
+// Try each fetch tool present on the system in turn; collect per-tool
+// errors so the UI can show something actionable instead of "failed".
+function download(url) {
+	ensure_dir(CACHE_DIR);
+
+	// Every ubus call runs as its own process; a per-pid temp file keeps
+	// concurrent calls (e.g. watchdog refresh + UI exit check) from racing.
+	const pid = trim(run('echo $PPID-$$').out) || sprintf('%d', time());
+	const tmp = sprintf('%s/download-%s.tmp', CACHE_DIR, pid);
+
+	const tools = [
+		[ 'uclient-fetch', sprintf("uclient-fetch -q --timeout=%d -O '%s' '%s' 2>&1", DL_TIMEOUT, tmp, url) ],
+		[ 'curl',          sprintf("curl -fsS --max-time %d -o '%s' '%s' 2>&1", DL_TIMEOUT, tmp, url) ],
+		[ 'wget',          sprintf("wget -q -T %d -O '%s' '%s' 2>&1", DL_TIMEOUT, tmp, url) ]
+	];
+
+	let errors = [];
+
+	for (let tool in tools) {
+		writefile(tmp, '');
+
+		const res = run(tool[1]);
+		const body = readfile(tmp);
+
+		if (res.rc === 0 && body && length(body) > 2) {
+			unlink(tmp);
+			return { body: body };
+		}
+
+		push(errors, sprintf('%s: %s (exit %d)', tool[0], trim(res.out) || 'no output', res.rc));
+	}
+
+	unlink(tmp);
+
+	let hint = '';
+	const all = lc(join(' ', errors));
+	if (index(all, 'ssl') >= 0 || index(all, 'certificate') >= 0 || index(all, 'tls') >= 0)
+		hint = ' — TLS problem: check that ca-bundle and a libustream-*ssl package are installed and the system clock is correct';
+	else if (index(all, 'bad address') >= 0 || index(all, 'resolve') >= 0)
+		hint = ' — DNS resolution failed: check the router DNS settings';
+
+	return { error: join(' | ', errors) + hint };
+}
+
+function parse_relays(body) {
+	let data;
+
+	try {
+		data = json(body);
+	}
+	catch (e) {
+		return { error: 'Mullvad API returned invalid JSON' };
+	}
+
+	if (type(data) != 'object' || type(data.wireguard) != 'object')
+		return { error: 'Unexpected Mullvad API response structure' };
+
+	const locations = data.locations ?? {};
+	let relays = [];
+
+	for (let r in (data.wireguard.relays ?? [])) {
+		if (!r.active || !r.hostname || !r.public_key)
+			continue;
+
+		const loc = locations[r.location] ?? {};
+
+		push(relays, {
+			hostname: r.hostname,
+			location: r.location ?? '',
+			country:  loc.country ?? uc(split(r.location ?? '??', '-')[0]),
+			city:     loc.city ?? (r.location ?? ''),
+			provider: r.provider ?? '',
+			owned:    !!r.owned,
+			weight:   int(r.weight),
+			ipv4:     r.ipv4_addr_in ?? '',
+			ipv6:     r.ipv6_addr_in ?? '',
+			pubkey:   r.public_key
+		});
+	}
+
+	if (!length(relays))
+		return { error: 'Mullvad API returned no active WireGuard relays' };
+
+	sort(relays, (a, b) =>
+		cmp(a.country, b.country) || cmp(a.city, b.city) || cmp(a.hostname, b.hostname));
+
+	return {
+		relays:      relays,
+		ports:       data.wireguard.port_ranges ?? [],
+		gateway_v4:  data.wireguard.ipv4_gateway ?? '10.64.0.1',
+		gateway_v6:  data.wireguard.ipv6_gateway ?? '',
+		fetched_at:  time()
+	};
+}
+
+function read_cache() {
+	for (let file in [ CACHE_FILE, PERSIST_FILE ]) {
+		const raw = readfile(file);
+		if (!raw)
+			continue;
+
+		try {
+			const cached = json(raw);
+			if (type(cached) == 'object' && length(cached.relays))
+				return cached;
+		}
+		catch (e) {
+			continue;
+		}
+	}
+
+	return null;
+}
+
+function relays_method(args) {
+	const ttl = int(args?.max_age) > 0 ? int(args.max_age) : DEFAULT_TTL;
+	const refresh = !!args?.refresh;
+	const cached = read_cache();
+
+	if (cached && !refresh && (time() - int(cached.fetched_at)) < ttl) {
+		cached.cached = true;
+		return cached;
+	}
+
+	const dl = download(API_URL);
+	const parsed = dl.error ? dl : parse_relays(dl.body);
+
+	if (parsed.error) {
+		// Fall back to stale cache rather than showing an empty page.
+		if (cached) {
+			cached.cached = true;
+			cached.stale = true;
+			cached.error = parsed.error;
+			return cached;
+		}
+		return { error: parsed.error };
+	}
+
+	ensure_dir(CACHE_DIR);
+	ensure_dir(PERSIST_DIR);
+	writefile(CACHE_FILE, sprintf('%J', parsed));
+	// Persistent copy so failover still has relay data right after a reboot.
+	writefile(PERSIST_FILE, sprintf('%J', parsed));
+
+	parsed.cached = false;
+	return parsed;
+}
+
+function status_method(args) {
+	const dev = args?.device ?? '';
+
+	if (!match(dev, /^[a-zA-Z0-9_-]{1,15}$/))
+		return { up: false, error: 'invalid device name' };
+
+	const res = run(sprintf("wg show '%s' dump 2>/dev/null", dev));
+	const lines = filter(split(res.out, '\n'), l => length(l) > 0);
+
+	if (res.rc !== 0 || length(lines) < 1)
+		return { up: false };
+
+	let peers = [];
+
+	for (let i = 1; i < length(lines); i++) {
+		const f = split(lines[i], '\t');
+		if (length(f) < 7)
+			continue;
+
+		push(peers, {
+			pubkey:    f[0],
+			endpoint:  f[2] == '(none)' ? '' : f[2],
+			handshake: int(f[4]),
+			rx:        int(f[5]),
+			tx:        int(f[6])
+		});
+	}
+
+	return {
+		up:          true,
+		listen_port: int(split(lines[0], '\t')[2]),
+		peers:       peers,
+		now:         time()
+	};
+}
+
+function check_method() {
+	const dl = download(CHECK_URL);
+
+	if (dl.error)
+		return { error: dl.error };
+
+	try {
+		const res = json(dl.body);
+		return type(res) == 'object' ? res : { error: 'Unexpected response from am.i.mullvad.net' };
+	}
+	catch (e) {
+		return { error: 'am.i.mullvad.net returned invalid JSON' };
+	}
+}
+
+// Ping every requested relay IP concurrently (one subshell per target) and
+// report the average RTT in milliseconds, or null for unreachable hosts.
+function probe_method(args) {
+	let targets = [];
+
+	for (let t in (args?.targets ?? [])) {
+		if (type(t) == 'string' && match(t, /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$/))
+			push(targets, t);
+		if (length(targets) >= MAX_PROBE_TARGETS)
+			break;
+	}
+
+	if (!length(targets))
+		return { error: 'no valid probe targets supplied' };
+
+	let cmds = [];
+	for (let ip in targets)
+		// BusyBox prints "round-trip min/avg/max", iputils "rtt min/avg/max/mdev".
+		push(cmds, sprintf(
+			"( r=$(ping -c 2 -W 1 -q '%s' 2>/dev/null | sed -n -e 's#^round-trip[^=]*= *[0-9.]*/\\([0-9.]*\\)/.*#\\1#p' -e 's#^rtt[^=]*= *[0-9.]*/\\([0-9.]*\\)/.*#\\1#p'); echo \"%s ${r:-fail}\" ) &",
+			ip, ip));
+
+	const res = run('( ' + join(' ', cmds) + ' wait ) 2>/dev/null');
+
+	let results = {};
+	for (let ip in targets)
+		results[ip] = null;
+
+	for (let line in split(res.out, '\n')) {
+		const f = split(trim(line), ' ');
+		if (length(f) == 2 && exists(results, f[0]) && f[1] != 'fail')
+			results[f[0]] = +f[1];
+	}
+
+	return { results: results };
+}
+
+function url_encode(s) {
+	let out = '';
+	for (let i = 0; i < length(s); i++) {
+		const c = substr(s, i, 1);
+		out += match(c, /^[A-Za-z0-9._~-]$/) ? c : sprintf('%%%02X', ord(c));
+	}
+	return out;
+}
+
+function api_error_text(body) {
+	try {
+		const e = json(body);
+		if (type(e) == 'object' && e.error)
+			return e.code ? sprintf('%s (%s)', e.error, e.code) : e.error;
+	}
+	catch (err) { }
+
+	return trim(body);
+}
+
+// Register this router as a Mullvad WireGuard device using only the account
+// number. Prefers the modern device API (needs curl for JSON POSTs), falls
+// back to the legacy form-encoded /wg/ endpoint which uclient-fetch handles.
+function setup_method(args) {
+	const account = replace(args?.account ?? '', / /g, '');
+
+	if (!match(account, /^[0-9]{10,19}$/))
+		return { error: 'Account number must be the digits of your Mullvad account number' };
+
+	const genkey = run('wg genkey 2>/dev/null');
+	const privkey = trim(genkey.out);
+	if (genkey.rc !== 0 || !match(privkey, /^[A-Za-z0-9+\/]{42,}=*$/))
+		return { error: 'Failed to generate a WireGuard key — is the wireguard-tools package installed?' };
+
+	const genpub = run(sprintf("echo '%s' | wg pubkey 2>/dev/null", privkey));
+	const pubkey = trim(genpub.out);
+	if (genpub.rc !== 0 || !length(pubkey))
+		return { error: 'Failed to derive the WireGuard public key' };
+
+	if (have('curl')) {
+		const auth = run(sprintf(
+			"curl -sS --max-time 15 -X POST -H 'Content-Type: application/json' -d '{\"account_number\":\"%s\"}' '%s' 2>&1",
+			account, AUTH_URL));
+
+		let token = null;
+		try {
+			token = json(auth.out)?.access_token;
+		}
+		catch (e) { }
+
+		if (!token)
+			return { error: 'Mullvad rejected the account number: ' + api_error_text(auth.out) };
+
+		const dev = run(sprintf(
+			"curl -sS --max-time 15 -X POST -H 'Content-Type: application/json' -H 'Authorization: Bearer %s' -d '{\"pubkey\":\"%s\",\"hijack_dns\":false}' '%s' 2>&1",
+			token, pubkey, DEVICES_URL));
+
+		let device = null;
+		try {
+			device = json(dev.out);
+		}
+		catch (e) { }
+
+		if (type(device) != 'object' || !device.ipv4_address)
+			return { error: 'Device registration failed: ' + api_error_text(dev.out) };
+
+		return {
+			private_key: privkey,
+			public_key:  pubkey,
+			ipv4:        device.ipv4_address,
+			ipv6:        device.ipv6_address ?? '',
+			device_name: device.name ?? '',
+			method:      'devices-api'
+		};
+	}
+
+	// Legacy fallback: form-encoded POST, plain-text response
+	// "10.x.y.z/32,fc00:bbbb::x/128" on success.
+	const legacy = run(sprintf(
+		"uclient-fetch -q --timeout=15 -O - --post-data='account=%s&pubkey=%s' '%s' 2>&1",
+		account, url_encode(pubkey), LEGACY_WG_URL));
+
+	const reply = trim(legacy.out);
+	const addrs = split(reply, ',');
+
+	if (legacy.rc !== 0 || !match(addrs[0] ?? '', /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\/[0-9]{1,2}$/))
+		return { error: 'Device registration failed: ' + (reply || 'no response from Mullvad') };
+
+	return {
+		private_key: privkey,
+		public_key:  pubkey,
+		ipv4:        trim(addrs[0]),
+		ipv6:        trim(addrs[1] ?? ''),
+		device_name: '',
+		method:      'legacy-wg'
+	};
+}
+
+const methods = {
+	relays: { args: { refresh: false, max_age: 0 },  call: relays_method },
+	status: { args: { device: 'device' },            call: status_method },
+	check:  { args: {},                              call: check_method },
+	probe:  { args: { targets: [] },                 call: probe_method },
+	setup:  { args: { account: 'account' },          call: setup_method }
+};
+
+if (ARGV[0] == 'list') {
+	let out = {};
+	for (let name, m in methods)
+		out[name] = m.args;
+	print(sprintf('%J\n', out));
+}
+else if (ARGV[0] == 'call' && exists(methods, ARGV[1])) {
+	let args = {};
+	const input = stdin.read('all');
+
+	if (input && length(trim(input))) {
+		try {
+			args = json(input);
+		}
+		catch (e) {
+			args = {};
+		}
+	}
+
+	print(sprintf('%J\n', methods[ARGV[1]].call(args)));
+}

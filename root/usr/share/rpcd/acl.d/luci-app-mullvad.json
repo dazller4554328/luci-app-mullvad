@@ -1,0 +1,17 @@
+{
+	"luci-app-mullvad": {
+		"description": "Grant access to the Mullvad VPN manager",
+		"read": {
+			"ubus": {
+				"luci.mullvad": [ "relays", "status", "check", "probe" ]
+			},
+			"uci": [ "mullvad", "network", "firewall" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.mullvad": [ "setup" ]
+			},
+			"uci": [ "mullvad", "network", "firewall" ]
+		}
+	}
+}
